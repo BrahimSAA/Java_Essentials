@@ -115,6 +115,12 @@ function validateUserKey(key) {
     throw new Error('Access key should contain special characters for better security');
   }
 
+  // Additional check for Firebase collection name compatibility
+  const safeCollectionName = createSafeCollectionName(key);
+  if (safeCollectionName.length < 3) {
+    throw new Error('Access key must result in a valid collection name (at least 3 characters after processing)');
+  }
+
   return true;
 }
 
@@ -131,6 +137,14 @@ function sanitizeInput(input) {
 
 async function encryptData(data, userKey) {
   try {
+    // Check data size before encryption
+    const dataString = JSON.stringify(data);
+    const sizeInMB = new Blob([dataString]).size / (1024 * 1024);
+    
+    if (sizeInMB > 1) {
+      console.warn('Data size is large:', sizeInMB.toFixed(2), 'MB');
+    }
+
     const encoder = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
       'raw',
@@ -143,7 +157,7 @@ async function encryptData(data, userKey) {
     const key = await crypto.subtle.deriveKey(
       {
         name: 'PBKDF2',
-        salt: encoder.encode('secure-course-tracker-2024'), // Unique salt
+        salt: encoder.encode('secure-tutorial-progress-2024'),
         iterations: 100000,
         hash: 'SHA-256'
       },
@@ -157,7 +171,7 @@ async function encryptData(data, userKey) {
     const encrypted = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv },
       key,
-      encoder.encode(JSON.stringify(data))
+      encoder.encode(dataString)
     );
 
     return {
@@ -166,7 +180,7 @@ async function encryptData(data, userKey) {
     };
   } catch (error) {
     console.error('Encryption failed:', error);
-    throw new Error('Failed to encrypt data');
+    throw new Error('Failed to encrypt data: ' + error.message);
   }
 }
 
@@ -186,7 +200,7 @@ async function decryptData(encryptedData, userKey) {
     const key = await crypto.subtle.deriveKey(
       {
         name: 'PBKDF2',
-        salt: encoder.encode('secure-course-tracker-2024'),
+        salt: encoder.encode('secure-tutorial-progress-2024'),
         iterations: 100000,
         hash: 'SHA-256'
       },
@@ -205,7 +219,7 @@ async function decryptData(encryptedData, userKey) {
     return JSON.parse(decoder.decode(decrypted));
   } catch (error) {
     console.error('Decryption failed:', error);
-    throw new Error('Failed to decrypt data');
+    throw new Error('Failed to decrypt data: ' + error.message);
   }
 }
 
@@ -320,7 +334,7 @@ function setupSecurityFeatures() {
 async function initializeFirebase(apiKey) {
   try {
     // Clear any existing Firebase apps first
-    if (firebase.apps.length > 0) {
+    if (typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length > 0) {
       await Promise.all(firebase.apps.map(app => app.delete()));
     }
 
@@ -333,22 +347,20 @@ async function initializeFirebase(apiKey) {
 
     // Initialize Firebase app
     const app = firebase.initializeApp(config);
-    db = firebase.firestore();
+    
+    // Initialize Firestore
+    db = firebase.firestore(app);
 
-    // Enable network for Firestore
-    await db.enableNetwork();
-
-    // Test with a simple read operation instead of write
+    // Test connection with a simple operation
     try {
-      // Try to read from a test collection (doesn't need to exist)
-      await db.collection('_test_connection').limit(1).get();
+      await db.collection('progress').limit(1).get();
+      console.log('Firebase connection test successful');
     } catch (testError) {
-      // If it's a permission error, that's actually good - means we connected
-      if (testError.code === 'permission-denied') {
-        console.log('Connected to Firebase (permission-denied is expected for test collection)');
-      } else {
+      // Permission denied is expected for security rules, but means connection works
+      if (testError.code !== 'permission-denied') {
         throw testError;
       }
+      console.log('Firebase connected (permission-denied is normal for test query)');
     }
 
     firebaseInitialized = true;
@@ -357,26 +369,26 @@ async function initializeFirebase(apiKey) {
 
   } catch (error) {
     console.error('Firebase initialization failed:', error);
-
-    // Clean up any partial initialization
-    try {
-      if (firebase.apps.length > 0) {
+    
+    // Clean up on failure
+    if (typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length > 0) {
+      try {
         await Promise.all(firebase.apps.map(app => app.delete()));
+      } catch (cleanupError) {
+        console.error('Cleanup error:', cleanupError);
       }
-    } catch (cleanupError) {
-      console.error('Cleanup error:', cleanupError);
     }
 
     firebaseInitialized = false;
     db = null;
 
-    // Provide more specific error messages
+    // Better error messages
     if (error.code === 'auth/invalid-api-key') {
       throw new Error('Invalid API key format');
     } else if (error.code === 'auth/api-key-not-valid') {
       throw new Error('API key is not valid for this project');
-    } else if (error.message.includes('network')) {
-      throw new Error('Network connection failed. Check your internet connection');
+    } else if (error.message && error.message.includes('network')) {
+      throw new Error('Network connection failed');
     } else {
       throw new Error('Failed to connect: ' + (error.message || 'Unknown error'));
     }
@@ -648,20 +660,15 @@ async function syncToFirebase() {
     return;
   }
 
-  // Check network connectivity first
-  const isConnected = await checkNetworkConnectivity();
-  if (!isConnected) {
-    updateSyncStatus('No internet connection', 'error');
-    return;
-  }
-
   updateSyncStatus('Syncing...', 'syncing');
 
   try {
     const pagePath = window.location.pathname;
+    const tutorialName = getTutorialNameFromPath();
+    const collectionName = createSafeCollectionName(userKey);
     const localData = {};
 
-    // Collect all local data
+    // Collect all local data for current page
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
       if (key && key.startsWith(pagePath) && key !== 'firebase-user-key') {
@@ -669,34 +676,41 @@ async function syncToFirebase() {
       }
     }
 
+    console.log('Syncing to collection:', collectionName, 'document:', tutorialName);
+
     // Encrypt data before sending
     const encryptedData = await encryptData(localData, userKey);
 
-    // Save to Firebase with retry logic
+    // Save to Firebase: Collection = AccessKey, Document = TutorialName
     let retryCount = 0;
     const maxRetries = 3;
 
     while (retryCount < maxRetries) {
       try {
-        await db.collection('progress').doc(userKey).set({
-          userKey: userKey,
+        await db.collection(collectionName).doc(tutorialName).set({
+          tutorialName: tutorialName,
+          originalPath: pagePath,
+          fullUrl: window.location.href,
+          accessKey: userKey, // Store for verification
           data: encryptedData,
           lastUpdated: firebase.firestore.FieldValue.serverTimestamp(),
-          pagePath: pagePath,
-          version: '2.0'
-        });
-        break; // Success, exit retry loop
+          version: '2.0',
+          createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        }, { merge: true }); // Use merge to update existing documents
+        
+        break;
       } catch (retryError) {
         retryCount++;
         if (retryCount >= maxRetries) {
           throw retryError;
         }
-        // Wait before retry
         await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
       }
     }
 
     updateSyncStatus('Synced successfully', 'synced');
+    console.log('Data synced to:', `${collectionName}/${tutorialName}`);
+    
     setTimeout(() => {
       if (isOnlineMode) {
         updateSyncStatus('Online', 'synced');
@@ -708,24 +722,14 @@ async function syncToFirebase() {
     let errorMessage = 'Sync failed';
 
     if (error.code === 'permission-denied') {
-      errorMessage = 'Permission denied - Check Firebase rules';
+      errorMessage = 'Permission denied - Check Firebase security rules';
     } else if (error.code === 'unavailable') {
-      errorMessage = 'Firebase unavailable - Try again later';
-    } else if (error.message.includes('network')) {
-      errorMessage = 'Network error - Check connection';
-    } else {
-      errorMessage = 'Sync failed - ' + error.message;
+      errorMessage = 'Firebase unavailable';
+    } else if (error.message && error.message.includes('network')) {
+      errorMessage = 'Network error';
     }
 
     updateSyncStatus(errorMessage, 'error');
-
-    // If authentication error, prompt for reconfiguration
-    if (error.code === 'permission-denied' || error.code === 'unauthenticated') {
-      setTimeout(() => {
-        isOnlineMode = false;
-        showFirebaseModal();
-      }, 3000);
-    }
   }
 }
 
@@ -744,26 +748,37 @@ async function loadFromFirebase() {
   updateSyncStatus('Loading from cloud...', 'syncing');
 
   try {
-    const doc = await db.collection('progress').doc(userKey).get();
+    const pagePath = window.location.pathname;
+    const tutorialName = getTutorialNameFromPath();
+    const collectionName = createSafeCollectionName(userKey);
+    
+    console.log('Loading from collection:', collectionName, 'document:', tutorialName);
+    
+    const doc = await db.collection(collectionName).doc(tutorialName).get();
 
     if (doc.exists) {
       const firebaseData = doc.data();
+      
+      // Verify this data belongs to the correct user
+      if (firebaseData.accessKey !== userKey) {
+        throw new Error('Data verification failed - access key mismatch');
+      }
+      
       let savedData = {};
 
       // Check if data is encrypted (version 2.0+)
-      if (firebaseData.version === '2.0' && firebaseData.data.data && firebaseData.data.iv) {
+      if (firebaseData.version === '2.0' && firebaseData.data && firebaseData.data.data && firebaseData.data.iv) {
         console.log('Loading encrypted data from Firebase...');
         savedData = await decryptData(firebaseData.data, userKey);
-      } else {
+      } else if (firebaseData.data) {
         // Legacy unencrypted data
-        console.log('Loading legacy unencrypted data from Firebase...');
-        savedData = firebaseData.data || {};
+        console.log('Loading legacy data from Firebase...');
+        savedData = firebaseData.data;
       }
 
-      console.log('Loaded data from Firebase:', Object.keys(savedData));
+      console.log('Loaded data keys:', Object.keys(savedData));
 
-      // Clear existing localStorage data for this page
-      const pagePath = window.location.pathname;
+      // Clear existing localStorage data for current page only
       const keysToRemove = [];
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
@@ -776,7 +791,7 @@ async function loadFromFirebase() {
       // Load data into localStorage
       Object.entries(savedData).forEach(([key, value]) => {
         try {
-          localStorage.setItem(key, typeof value === "string" ? value.replace(/\\n/g, "\n") : value);
+          localStorage.setItem(key, typeof value === "string" ? value : String(value));
         } catch (error) {
           console.warn('Failed to load item to localStorage:', key, error);
         }
@@ -790,8 +805,9 @@ async function loadFromFirebase() {
       setTimeout(() => {
         updateSyncStatus('Online', 'synced');
       }, 2000);
+      
     } else {
-      console.log('No cloud data found for key:', userKey);
+      console.log('No cloud data found for:', `${collectionName}/${tutorialName}`);
       updateSyncStatus('No cloud data found', 'synced');
       setTimeout(() => {
         updateSyncStatus('Online', 'synced');
@@ -801,14 +817,6 @@ async function loadFromFirebase() {
   } catch (error) {
     console.error('Load error:', error);
     updateSyncStatus('Load failed - ' + error.message, 'error');
-
-    // If authentication error, prompt for reconfiguration
-    if (error.code === 'permission-denied' || error.code === 'unauthenticated') {
-      setTimeout(() => {
-        isOnlineMode = false;
-        showFirebaseModal();
-      }, 3000);
-    }
   }
 }
 
@@ -1255,59 +1263,7 @@ function setupNotesTools() {
     const boldBtn = container.querySelector('[id^="bold-"]');
     const italicBtn = container.querySelector('[id^="italic-"]');
     const clearBtn = container.querySelector('[id^="clear-"]');
-    /*
-        if (boldBtn && notesInput) {
-          boldBtn.addEventListener('click', () => {
-            const start = notesInput.selectionStart;
-            const end = notesInput.selectionEnd;
-            const selectedText = notesInput.value.substring(start, end);
     
-            if (selectedText) {
-              const beforeText = notesInput.value.substring(0, start);
-              const afterText = notesInput.value.substring(end);
-              notesInput.value = beforeText + '**' + selectedText + '**' + afterText;
-              notesInput.focus();
-              notesInput.setSelectionRange(start + 2, end + 2);
-            }
-            updateCharacterCounter(notesInput);
-    
-            // Save to localStorage
-            const section = notesInput.closest('.video-section');
-            const pagePath = window.location.pathname;
-            try {
-              localStorage.setItem(`${pagePath}-notes-${section.id}`, notesInput.value);
-            } catch (error) {
-              console.warn('LocalStorage not available');
-            }
-          });
-        }
-    
-        if (italicBtn && notesInput) {
-          italicBtn.addEventListener('click', () => {
-            const start = notesInput.selectionStart;
-            const end = notesInput.selectionEnd;
-            const selectedText = notesInput.value.substring(start, end);
-    
-            if (selectedText) {
-              const beforeText = notesInput.value.substring(0, start);
-              const afterText = notesInput.value.substring(end);
-              notesInput.value = beforeText + '*' + selectedText + '*' + afterText;
-              notesInput.focus();
-              notesInput.setSelectionRange(start + 1, end + 1);
-            }
-            updateCharacterCounter(notesInput);
-    
-            // Save to localStorage
-            const section = notesInput.closest('.video-section');
-            const pagePath = window.location.pathname;
-            try {
-              localStorage.setItem(`${pagePath}-notes-${section.id}`, notesInput.value);
-            } catch (error) {
-              console.warn('LocalStorage not available');
-            }
-          });
-        }
-    */
     if (clearBtn && notesInput) {
       clearBtn.addEventListener('click', () => {
         if (confirm('Are you sure you want to clear all notes for this video?')) {
@@ -1330,3 +1286,90 @@ function setupNotesTools() {
   });
 }
 
+
+function getTutorialNameFromPath() {
+  const fullPath = window.location.pathname;
+  // Extract tutorial name from path like "/Security_Operations_-SOC-_101/s1.html" 
+  // or "https://BrahimSAA.github.io/Python_101_for_Hackers/index.html"
+  
+  let tutorialName = '';
+  
+  if (fullPath.includes('/')) {
+    const pathParts = fullPath.split('/').filter(part => part.length > 0);
+    // Get the first meaningful part (tutorial folder name)
+    tutorialName = pathParts[0] || 'default_tutorial';
+  } else {
+    tutorialName = 'default_tutorial';
+  }
+  
+  // Clean the tutorial name to be Firebase-safe
+  tutorialName = tutorialName
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+    
+  console.log('Tutorial name from path:', tutorialName);
+  return tutorialName || 'default_tutorial';
+}
+
+function createSafeCollectionName(accessKey) {
+  // Firebase collection names have restrictions, so we'll create a safe version
+  // while keeping it recognizable
+  return accessKey
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .substring(0, 100); // Limit length
+}
+
+async function listUserTutorials() {
+  if (!db || !userKey || !firebaseInitialized) {
+    console.log('Cannot list tutorials: missing requirements');
+    return [];
+  }
+
+  try {
+    const collectionName = createSafeCollectionName(userKey);
+    const snapshot = await db.collection(collectionName).get();
+    
+    const tutorials = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      tutorials.push({
+        id: doc.id,
+        tutorialName: data.tutorialName,
+        originalPath: data.originalPath,
+        fullUrl: data.fullUrl,
+        lastUpdated: data.lastUpdated,
+        createdAt: data.createdAt
+      });
+    });
+    
+    console.log('User tutorials:', tutorials);
+    return tutorials;
+  } catch (error) {
+    console.error('Error listing tutorials:', error);
+    return [];
+  }
+}
+
+function debugFirebaseStructure() {
+  const tutorialName = getTutorialNameFromPath();
+  const collectionName = createSafeCollectionName(userKey);
+  
+  console.log('=== Firebase Structure Debug ===');
+  console.log('Access Key:', userKey);
+  console.log('Collection Name:', collectionName);
+  console.log('Tutorial Name (Document):', tutorialName);
+  console.log('Current Path:', window.location.pathname);
+  console.log('Full URL:', window.location.href);
+  console.log('================================');
+  
+  return {
+    accessKey: userKey,
+    collectionName: collectionName,
+    documentName: tutorialName,
+    path: window.location.pathname,
+    url: window.location.href
+  };
+}
